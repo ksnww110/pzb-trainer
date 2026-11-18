@@ -5,6 +5,8 @@ using System.Reflection;
 using System.Security.Cryptography;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
+using System.Text;
 
 namespace PBZTrainer.Services
 {
@@ -26,12 +28,70 @@ namespace PBZTrainer.Services
         public const string GameExe = "PBZ";
         public const string BridgeFileName = "PBZBridge.dll";
 
+
+        [DllImport("kernel32.dll", EntryPoint = "OpenProcess",
+            SetLastError = true)]
+        private static extern IntPtr OpenProcessForQuery(
+            uint access, bool inherit, int pid);
+
+        [DllImport("kernel32.dll",
+            EntryPoint = "QueryFullProcessImageNameW",
+            CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool QueryImagePath(
+            IntPtr handle, int flags,
+            StringBuilder buffer, ref int size);
+
+        [DllImport("kernel32.dll", EntryPoint = "CloseHandle")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseQueryHandle(IntPtr handle);
+
+        private static string GetExePath(int pid)
+        {
+            const uint QUERY_LIMITED_INFORMATION = 0x1000;
+
+            IntPtr h = OpenProcessForQuery(
+                QUERY_LIMITED_INFORMATION, false, pid);
+
+            if (h == IntPtr.Zero)
+                return null;
+
+            try
+            {
+                var sb = new StringBuilder(32768);
+                int size = sb.Capacity;
+
+                return QueryImagePath(h, 0, sb, ref size)
+                    ? sb.ToString()
+                    : null;
+            }
+            finally
+            {
+                CloseQueryHandle(h);
+            }
+        }
+
         public static Process[] Candidates()
         {
             try
             {
                 return Process.GetProcessesByName(GameExe)
-                    .Where(p => { try { return string.Equals(Path.GetFileName(p.MainModule.FileName), "PBZ.exe", StringComparison.OrdinalIgnoreCase); } catch { return false; } })
+                    .Where(p =>
+                    {
+                        try
+                        {
+                            string path = GetExePath(p.Id);
+
+                            return string.Equals(
+                                Path.GetFileName(path),
+                                "PBZ.exe",
+                                StringComparison.OrdinalIgnoreCase);
+                        }
+                        catch
+                        {
+                            return false;
+                        }
+                    })
                     .ToArray();
             }
             catch
@@ -40,31 +100,54 @@ namespace PBZTrainer.Services
             }
         }
 
-        /// <summary>按内存占用挑选真正的游戏进程（原版要求模块内存 &gt; 100MB）。</summary>
         public static GameProcess FindGame()
         {
             GameProcess best = null;
+
             foreach (var p in Candidates())
             {
                 try
                 {
-                    int moduleSize = p.MainModule.ModuleMemorySize;
-                    if (moduleSize <= 100 * 1024 * 1024) continue;
-                    var g = new GameProcess
+                    string path = GetExePath(p.Id);
+
+                    if (string.IsNullOrEmpty(path))
+                        continue;
+
+                    long memory = 0;
+
+                    try
+                    {
+                        memory = p.WorkingSet64;
+                    }
+                    catch
+                    {
+                    }
+
+                    var game = new GameProcess
                     {
                         Pid = p.Id,
-                        ExePath = p.MainModule.FileName,
-                        WorkingSetBytes = p.WorkingSet64
+                        ExePath = path,
+                        WorkingSetBytes = memory
                     };
-                    if (best == null || g.WorkingSetBytes > best.WorkingSetBytes) best = g;
+
+                    if (best == null ||
+                        game.WorkingSetBytes > best.WorkingSetBytes)
+                    {
+                        best = game;
+                    }
                 }
                 catch
                 {
-                    // 权限不足时跳过
+                }
+                finally
+                {
+                    p.Dispose();
                 }
             }
+
             return best;
         }
+
 
         public static string PipeName(int pid) => $@"\\.\pipe\ChuwuPBZ_v1_{pid}";
 
